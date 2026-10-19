@@ -1,6 +1,7 @@
 """Отрисовка таблицы топа репутации в PNG."""
 
 import io
+import math
 import unicodedata
 from functools import lru_cache
 
@@ -27,6 +28,7 @@ CARD_ALT = (34, 38, 50)
 TEXT = (240, 242, 247)
 MUTED = (134, 141, 158)
 ACCENT = (110, 168, 255)
+STAR_ALPHA = 55  # прозрачность звёзд на фоне (0 — не видно, 255 — сплошные)
 MEDALS = {1: (255, 196, 61), 2: (200, 208, 220), 3: (222, 145, 86)}
 # цвета «пустых» аватарок как в Telegram
 AVATAR_COLORS = [
@@ -130,6 +132,36 @@ def _avatar(m: Member, photo: bytes | None, size: int) -> Image.Image:
     return img
 
 
+def _star(radius: int) -> Image.Image:
+    """Белая пятиконечная звезда (как на флаге ЕС) с полупрозрачностью."""
+    k = 4  # сглаживание
+    size = radius * 2 * k
+    big = Image.new("L", (size, size), 0)
+    points = []
+    for j in range(10):
+        r = radius * k * (1 if j % 2 == 0 else 0.382)
+        a = math.radians(-90 + j * 36)
+        points.append((size / 2 + r * math.cos(a), size / 2 + r * math.sin(a)))
+    ImageDraw.Draw(big).polygon(points, fill=STAR_ALPHA)
+    star = Image.new("RGBA", (radius * 2, radius * 2), (255, 255, 255, 0))
+    star.putalpha(big.resize((radius * 2, radius * 2), Image.LANCZOS))
+    return star
+
+
+def _draw_stars(img: Image.Image) -> Image.Image:
+    """Круг из 12 звёзд по центру картинки, пропорции как на флаге ЕС."""
+    w, h = img.size
+    ring = min(w, h) * 0.36
+    star = _star(int(ring / 6))
+    layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    for i in range(12):
+        a = math.radians(i * 30)
+        x = w / 2 + ring * math.sin(a) - star.width / 2
+        y = h / 2 - ring * math.cos(a) - star.height / 2
+        layer.alpha_composite(star, (int(x), int(y)))
+    return Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
+
+
 def render_top(chat_title: str, members: list[Member], avatars: dict[int, bytes | None]) -> bytes:
     rows = max(len(members), 1)
     height = HEADER_H + COLS_H + rows * ROW_H + PAD
@@ -138,6 +170,14 @@ def render_top(chat_title: str, members: list[Member], avatars: dict[int, bytes 
 
     def box(x0, y0, x1, y1, r, fill):
         d.rounded_rectangle((x0 * S, y0 * S, x1 * S, y1 * S), r * S, fill=fill)
+
+    # сначала плашки строк, потом поверх них звёзды, а уже потом текст и аватарки
+    y0 = HEADER_H + COLS_H
+    for i in range(1, rows + 1):
+        y = y0 + (i - 1) * ROW_H
+        box(PAD, y, WIDTH - PAD, y + ROW_H - ROW_GAP, 14, CARD if i % 2 else CARD_ALT)
+    img = _draw_stars(img)
+    d = ImageDraw.Draw(img)
 
     def text(x, y, t, f, fill, anchor="la"):
         d.text((x * S, y * S), t, font=f, fill=fill, anchor=anchor)
@@ -160,14 +200,12 @@ def render_top(chat_title: str, members: list[Member], avatars: dict[int, bytes 
     y += COLS_H
 
     if not members:
-        box(PAD, y, WIDTH - PAD, y + ROW_H - ROW_GAP, 14, CARD)
         text(WIDTH / 2, y + (ROW_H - ROW_GAP) / 2, "Пока никто не получил репутацию",
              font("Medium", 22), MUTED, "mm")
 
     mask = _circle_mask(AVATAR * S)
     name_max_w = (x_rep_r - 130 - x_name) * S
     for i, m in enumerate(members, start=1):
-        box(PAD, y, WIDTH - PAD, y + ROW_H - ROW_GAP, 14, CARD if i % 2 else CARD_ALT)
         cy = y + (ROW_H - ROW_GAP) / 2
 
         if i in MEDALS:
