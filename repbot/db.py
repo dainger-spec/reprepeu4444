@@ -46,6 +46,15 @@ SCHEMA = [
         PRIMARY KEY (chat_id, username)
     )
     """,
+    # +rep по @username тем, кого бот ещё не видел: начислится при первом появлении
+    """
+    CREATE TABLE IF NOT EXISTS pending_rep (
+        chat_id  BIGINT NOT NULL,
+        username TEXT NOT NULL,
+        rep      BIGINT NOT NULL,
+        PRIMARY KEY (chat_id, username)
+    )
+    """,
     # группы и решение администратора бота: allowed / denied / pending
     """
     CREATE TABLE IF NOT EXISTS chats (
@@ -307,3 +316,21 @@ class Database:
             await self.execute("UPDATE users SET chat_id = ? WHERE chat_id = ?", new_id, old_id)
         await self.execute("UPDATE rep_log SET chat_id = ? WHERE chat_id = ?", new_id, old_id)
         await self.execute("UPDATE rep_import SET chat_id = ? WHERE chat_id = ?", new_id, old_id)
+
+    # ---------- отложенная репутация по @username ----------
+
+    async def add_pending_rep(self, chat_id: int, username: str, delta: int) -> None:
+        await self.execute(
+            """
+            INSERT INTO pending_rep (chat_id, username, rep) VALUES (?, ?, ?)
+            ON CONFLICT (chat_id, username) DO UPDATE SET rep = pending_rep.rep + excluded.rep
+            """,
+            chat_id, username, delta,
+        )
+
+    async def all_pending_rep(self) -> list[tuple[int, str, int]]:
+        rows = await self.fetchall("SELECT chat_id, username, rep FROM pending_rep")
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    async def delete_pending_rep(self, chat_id: int, username: str) -> None:
+        await self.execute("DELETE FROM pending_rep WHERE chat_id = ? AND username = ?", chat_id, username)

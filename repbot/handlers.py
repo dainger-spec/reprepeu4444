@@ -89,6 +89,32 @@ async def ensure_member(db: Database, bot: Bot, chat_id: int, user: User) -> Mem
     return await db.get(chat_id, user.id)
 
 
+_admins_synced: dict[int, float] = {}
+
+
+async def sync_admins(bot: Bot, db: Database, chat_id: int) -> None:
+    """Подтягивает администраторов группы — единственный список участников, который даёт Bot API."""
+    now = time.monotonic()
+    if now - _admins_synced.get(chat_id, -1e9) < 600:
+        return
+    _admins_synced[chat_id] = now
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        for admin in admins:
+            if not admin.user.is_bot:
+                await ensure_member(db, bot, chat_id, admin.user)
+    except Exception as e:  # это лишь подсказка для поиска по нику — не роняем из-за неё команду
+        log.warning("Не удалось получить админов группы %s: %s", chat_id, e)
+
+
+async def find_member(bot: Bot, db: Database, chat_id: int, username: str) -> Member | None:
+    member = await db.find_by_username(chat_id, username)
+    if member is None:
+        await sync_admins(bot, db, chat_id)
+        member = await db.find_by_username(chat_id, username)
+    return member
+
+
 async def resolve_target(
     message: Message, command: CommandObject, db: Database
 ) -> tuple[Member | None, list[str], str | None]:
@@ -104,7 +130,7 @@ async def resolve_target(
         return await ensure_member(db, message.bot, message.chat.id, reply_user), args, None
 
     if args and args[0].startswith("@"):
-        member = await db.find_by_username(message.chat.id, args[0])
+        member = await find_member(message.bot, db, message.chat.id, args[0].lstrip("@"))
         if member is None:
             return None, args[1:], f"Не знаю участника {escape(args[0])} — он ещё ничего не писал в этом чате."
         return member, args[1:], None
@@ -202,8 +228,11 @@ def is_plus_rep(text: str | None) -> bool:
     return False
 
 
-async def rep_target(message: Message, bot: Bot, db: Database) -> tuple[Member | None, str | None]:
-    """Кому +rep: ответом на сообщение, упоминанием из списка участников или @username."""
+async def rep_target(message: Message, bot: Bot, db: Database) -> tuple[Member | None, str | None, str | None]:
+    """Кому +rep: ответом на сообщение, упоминанием из списка участников или @username.
+
+    Возвращает (участник, ник для отложенного +rep, текст ошибки).
+    """
     user = replied_user(message)
     if user is None:
         for entity in message.entities or []:
@@ -211,16 +240,19 @@ async def rep_target(message: Message, bot: Bot, db: Database) -> tuple[Member |
                 user = entity.user  # упомянули человека без ника
                 break
             if entity.type == "mention":
-                username = entity.extract_from(message.text)
-                member = await db.find_by_username(message.chat.id, username)
-                if member is None:
-                    return None, f"Не знаю участника {escape(username)} — он ещё ничего не писал в этом чате."
-                return member, None
+                username = entity.extract_from(message.text).lstrip("@")
+                member = await find_member(bot, db, message.chat.id, username)
+                if member is not None:
+                    return member, None, None
+                me = await bot.me()
+                if username.lower() == (me.username or "").lower() or username.lower().endswith("bot"):
+                    return None, None, "Ботам репутацию не выдают 🙂"
+                return None, username, None  # бот его ещё не видел — начислим, когда появится
     if user is None:
-        return None, "Чтобы выдать +rep, ответьте на сообщение участника или напишите <code>+rep @username</code>."
+        return None, None, "Чтобы выдать +rep, ответьте на сообщение участника или напишите <code>+rep @username</code>."
     if user.is_bot:
-        return None, "Ботам репутацию не выдают 🙂"
-    return await ensure_member(db, bot, message.chat.id, user), None
+        return None, None, "Ботам репутацию не выдают 🙂"
+    return await ensure_member(db, bot, message.chat.id, user), None, None
 
 
 @router.message(group_only, F.text.func(is_plus_rep))
@@ -233,14 +265,16 @@ async def plus_rep(message: Message, bot: Bot, db: Database, config: Config) -> 
 
     chat_id = message.chat.id
     async with rep_lock:
-        target, error = await rep_target(message, bot, db)
+        target, pending_name, error = await rep_target(message, bot, db)
         if error:
             await message.reply(error)
             return
-        if target.user_id == giver.id:
+        if target is not None and target.user_id == giver.id or (
+            pending_name and giver.username and pending_name.lower() == giver.username.lower()
+        ):
             await message.reply("Себе репутацию поднять нельзя.")
             return
-        if target.banned:
+        if target is not None and target.banned:
             await message.reply("Этому участнику запрещено пользоваться ботом — репутацию ему выдать нельзя.")
             return
 
@@ -254,12 +288,25 @@ async def plus_rep(message: Message, bot: Bot, db: Database, config: Config) -> 
             )
             return
 
-        new_rep = await db.add_rep(chat_id, target.user_id, 1)
-        await db.log_rep(chat_id, giver.id, target.user_id)
+        if target is not None:
+            new_rep = await db.add_rep(chat_id, target.user_id, 1)
+            await db.log_rep(chat_id, giver.id, target.user_id)
+        else:
+            waiting = await importer.defer(chat_id, pending_name)
+            await db.log_rep(chat_id, giver.id, 0)
 
-    giver_member = await db.get(chat_id, giver.id)
-    await apply_tag(bot, chat_id, target.user_id, make_tag(config.tag_format, new_rep))
     left = config.daily_rep_limit - given - 1
+    giver_member = await db.get(chat_id, giver.id)
+    if target is None:
+        await message.reply(
+            f"⏳ +1 к репутации @{escape(pending_name)} от {mention(giver_member)} сохранён.\n"
+            "Этот участник ещё не писал в группе при боте, поэтому я пока его не знаю. "
+            f"Репутация (+{waiting}) начислится, как только он напишет.\n"
+            f"Осталось +rep на сутки: {left}/{config.daily_rep_limit}"
+        )
+        return
+
+    await apply_tag(bot, chat_id, target.user_id, make_tag(config.tag_format, new_rep))
     await message.reply(
         f"👍 +1 к репутации {mention(target)} от {mention(giver_member)}\n"
         f"⭐ Теперь: <b>{new_rep}</b>\n"

@@ -1,8 +1,10 @@
-"""Перенос репутации из старого топа (файл rep_import.csv).
+"""Отложенная репутация по нику.
 
-У старых данных есть только ник, а не Telegram ID, поэтому репутация
-начисляется, когда человек с этим ником появляется в группе: пишет сообщение,
-вступает или на его сообщение отвечают.
+Два источника: перенос из старого топа (файл rep_import.csv) и +rep @username
+тем, кого бот ещё не видел. Бот не может узнать человека по нику (в Bot API нет
+ни списка участников, ни поиска по нику), поэтому репутация начисляется, когда
+человек с этим ником появляется в группе: пишет сообщение, вступает или на его
+сообщение отвечают.
 """
 
 import logging
@@ -35,17 +37,21 @@ class RepImporter:
     def __init__(self) -> None:
         self._db: Database | None = None
         self._tag_format = ""
-        # chat_id -> {ник: репутация} для ещё не начисленных записей
+        # chat_id -> {ник: репутация} для ещё не начисленных записей переноса
         self._pending: dict[int, dict[str, int]] = {}
+        # chat_id -> {ник: сколько +rep ждёт} для +rep @username
+        self._deferred: dict[int, dict[str, int]] = {}
 
     async def load(self, db: Database, tag_format: str) -> None:
         self._db = db
         self._tag_format = tag_format
         for chat_id, username, rep in await db.pending_imports():
             self._pending.setdefault(chat_id, {})[username] = rep
-        total = sum(len(x) for x in self._pending.values())
+        for chat_id, username, rep in await db.all_pending_rep():
+            self._deferred.setdefault(chat_id, {})[username] = rep
+        total = sum(len(x) for x in self._pending.values()) + sum(len(x) for x in self._deferred.values())
         if total:
-            log.info("Ожидают переноса репутации: %d ник(ов)", total)
+            log.info("Ожидают начисления репутации по нику: %d", total)
 
     def _find(self, chat_id: int, username: str | None) -> str | None:
         entries = self._pending.get(chat_id)
@@ -60,15 +66,23 @@ class RepImporter:
         return None
 
     async def match(self, bot: Bot, chat_id: int, user_id: int, username: str | None) -> None:
-        """Начисляет перенесённую репутацию, если ник есть в списке. Профиль уже должен быть в БД."""
-        key = self._find(chat_id, username)
-        if key is None:
-            return
-        rep = self._pending[chat_id].pop(key)  # сразу убираем, чтобы не начислить дважды
+        """Начисляет отложенную репутацию, если ник есть в списках. Профиль уже должен быть в БД."""
         db = self._db
+        rep = 0
+        # из словарей убираем сразу, до любых await, чтобы не начислить дважды
+        key = self._find(chat_id, username)
+        if key is not None:
+            rep += self._pending[chat_id].pop(key)
+            await db.mark_import_applied(chat_id, key, user_id)
+        if username and self._deferred.get(chat_id):
+            deferred = self._deferred[chat_id].pop(username.lower(), 0)
+            if deferred:
+                rep += deferred
+                await db.delete_pending_rep(chat_id, username.lower())
+        if not rep:
+            return
         new_rep = await db.add_rep(chat_id, user_id, rep)
-        await db.mark_import_applied(chat_id, key, user_id)
-        log.info("Перенесена репутация %+d → @%s (%s) в чате %s, теперь %d",
+        log.info("Начислена отложенная репутация %+d → @%s (%s) в чате %s, теперь %d",
                  rep, username, user_id, chat_id, new_rep)
         member = await db.get(chat_id, user_id)
         if not member.banned:
@@ -91,6 +105,14 @@ class RepImporter:
                 await self.match(bot, chat_id, user_id, username)
                 applied += 1
         return added, skipped, applied
+
+    async def defer(self, chat_id: int, username: str) -> int:
+        """+1 к репутации человека, которого бот ещё не видел. Возвращает, сколько у него уже ждёт."""
+        name = username.lstrip("@").lower()
+        chat = self._deferred.setdefault(chat_id, {})
+        chat[name] = chat.get(name, 0) + 1
+        await self._db.add_pending_rep(chat_id, name, 1)
+        return chat[name]
 
     def waiting(self, chat_id: int) -> list[str]:
         return sorted(self._pending.get(chat_id, {}))
