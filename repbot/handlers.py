@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+from datetime import datetime
 from html import escape
 
 from aiogram import Bot, F, Router
@@ -16,8 +17,9 @@ from aiogram.types import (
     User,
 )
 
+from . import __version__
 from .access import ALLOWED, DENIED, access, chats_list
-from .avatars import get_avatar, get_avatars
+from .avatars import diagnose, get_avatar, get_avatars
 from .config import Config
 from .db import Database, Member
 from .importer import IMPORT_FILE, importer
@@ -59,6 +61,7 @@ ADMIN_HELP_TEXT = (
     "/setrep N — установить репутацию (в ответ или <code>/setrep @username N</code>)\n"
     "/addrep N — прибавить/отнять репутацию (N может быть отрицательным)\n"
     "/check — проверить, хватает ли боту прав для плашек\n"
+    "/avatar — почему не грузится аватарка (в ответ, @username или про себя)\n"
     "/importrep — перенести репутацию из rep_import.csv в эту группу (один раз)\n"
     "/chatid — узнать ID группы"
 )
@@ -173,8 +176,23 @@ async def cmd_help(message: Message, config: Config) -> None:
     text = HELP_TEXT.format(limit=config.daily_rep_limit)
     # админские команды показываем только самому админу в личке
     if message.from_user and message.from_user.id in config.admin_ids:
-        text += ADMIN_HELP_TEXT
+        text += ADMIN_HELP_TEXT + f"\n\n<i>Версия бота: {__version__}</i>"
     await message.reply(text)
+
+
+def profile_text(m: Member, place: int, total: int, config: Config) -> str:
+    joined = datetime.fromtimestamp(m.joined_at, config.tz).strftime("%d.%m.%Y")
+    lines = [
+        f"👤 <b>{escape(m.display_name)}</b>",
+        f"🔗 @{escape(m.username)}" if m.username else f"🆔 <code>{m.user_id}</code>",
+        "",
+        f"⭐ Репутация: <b>{m.rep}</b>" + ("" if m.banned else f" (место {place} из {total})"),
+        f"💬 Сообщений: <b>{m.messages}</b>",
+        f"📅 В группе с: <b>{joined}</b>",
+    ]
+    if m.banned:
+        lines.append("\n⛔ Доступ к боту заблокирован")
+    return "\n".join(lines)
 
 
 @router.message(Command("profile"), group_only)
@@ -193,12 +211,16 @@ async def cmd_profile(message: Message, command: CommandObject, bot: Bot, db: Da
 
     place = await db.place(message.chat.id, target.rep)
     total = await db.member_count(message.chat.id)
-    photo = await get_avatar(bot, target.user_id)
-    png = await asyncio.to_thread(
-        render_profile, target, place, total, make_tag(config.tag_format, target.rep),
-        message.chat.title or "", photo, config.tz,
-    )
-    await message.reply_photo(BufferedInputFile(png, filename="profile.png"))
+    try:
+        photo = await get_avatar(bot, target.user_id)
+        png = await asyncio.to_thread(
+            render_profile, target, place, total, make_tag(config.tag_format, target.rep),
+            message.chat.title or "", photo, config.tz,
+        )
+        await message.reply_photo(BufferedInputFile(png, filename="profile.png"))
+    except Exception:
+        log.exception("Не удалось отправить карточку профиля картинкой — отправляю текстом")
+        await message.reply(profile_text(target, place, total, config) + "\n\n<i>(картинку отправить не удалось)</i>")
 
 
 @router.message(Command("top"), group_only)
@@ -207,8 +229,14 @@ async def cmd_top(message: Message, bot: Bot, db: Database) -> None:
         return
     members = await db.top(message.chat.id, 15)
     avatars = await get_avatars(bot, [m.user_id for m in members])
-    png = await asyncio.to_thread(render_top, message.chat.title or "", members, avatars)
-    await message.reply_photo(BufferedInputFile(png, filename="top.png"))
+    try:
+        png = await asyncio.to_thread(render_top, message.chat.title or "", members, avatars)
+        await message.reply_photo(BufferedInputFile(png, filename="top.png"))
+    except Exception:
+        log.exception("Не удалось отправить топ картинкой — отправляю текстом")
+        lines = [f"{i}. {escape(m.display_name)} — <b>{m.rep}</b>" for i, m in enumerate(members, 1)]
+        await message.reply("<b>Топ-15 по репутации</b>\n\n" + ("\n".join(lines) or "Пока никто не получил репутацию")
+                            + "\n\n<i>(картинку отправить не удалось)</i>")
 
 
 @router.message(Command("profile", "top"))
@@ -537,3 +565,19 @@ async def on_chat_button(cb: CallbackQuery, bot: Bot, config: Config) -> None:
             await cb.message.edit_text(cb.message.html_text + "\n\n" + result, reply_markup=None)
     except TelegramAPIError:
         pass
+
+
+@router.message(Command("avatar"), group_only)
+async def cmd_avatar(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config) -> None:
+    if message.from_user is None or message.from_user.id not in config.admin_ids:
+        return
+    target, _, error = await resolve_target(message, command, db)
+    if error:
+        await message.reply(error)
+        return
+    if target is None:
+        target = await ensure_member(db, bot, message.chat.id, message.from_user)
+    lines = await diagnose(bot, target.user_id)
+    await message.reply(
+        f"<b>Аватарка {escape(target.display_name)}</b>\n\n" + "\n".join("• " + escape(x) for x in lines)
+    )

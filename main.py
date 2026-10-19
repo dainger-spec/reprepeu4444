@@ -8,6 +8,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeChat, BotCommandScopeDefault
 
+from repbot import __version__
 from repbot.access import access
 from repbot.config import BASE_DIR, ConfigError, load_config
 from repbot.db import Database
@@ -118,7 +119,7 @@ def setup_logging() -> None:
 
 def run() -> None:
     setup_logging()
-    log.info("Запуск: Python %s", sys.version.split()[0])
+    log.info("Запуск РЕП версии %s (Python %s)", __version__, sys.version.split()[0])
     try:
         asyncio.run(main())
     except ConfigError as e:
