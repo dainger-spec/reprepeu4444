@@ -1,12 +1,14 @@
-FROM python:3.13-slim
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install -r requirements.txt
 COPY . .
 
-# сюда пишется база SQLite — подключите volume, чтобы данные не пропадали
-ENV DB_PATH=/app/data/repbot.db
-VOLUME ["/app/data"]
-
+# База SQLite по умолчанию пишется в /app/data — подключите туда постоянный диск (volume).
+# Токен и остальные настройки передаются переменными окружения хостинга, в образ они не попадают.
 CMD ["python", "main.py"]

@@ -1,0 +1,10 @@
+# Запуск на своём сервере (VPS):
+#   cp .env.example .env   # впишите BOT_TOKEN
+#   docker compose up -d --build
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data   # база лежит в папке data рядом с проектом и переживает перезапуски

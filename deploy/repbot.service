@@ -1,0 +1,19 @@
+# systemd-сервис для VPS без Docker.
+# 1) Скопируйте проект в /opt/repbot, создайте venv и установите зависимости:
+#      python3 -m venv /opt/repbot/.venv && /opt/repbot/.venv/bin/pip install -r /opt/repbot/requirements.txt
+# 2) Создайте /opt/repbot/.env и впишите BOT_TOKEN (см. .env.example)
+# 3) sudo cp deploy/repbot.service /etc/systemd/system/ && sudo systemctl enable --now repbot
+# Логи: journalctl -u repbot -f
+[Unit]
+Description=REP Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/repbot
+ExecStart=/opt/repbot/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
