@@ -6,8 +6,9 @@ from logging.handlers import RotatingFileHandler
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
-from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeDefault
+from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeChat, BotCommandScopeDefault
 
+from repbot.access import access
 from repbot.config import BASE_DIR, ConfigError, load_config
 from repbot.db import Database
 from repbot.handlers import router
@@ -20,6 +21,7 @@ COMMANDS = [
     BotCommand(command="top", description="Топ-15 по репутации"),
     BotCommand(command="help", description="Справка"),
 ]
+ADMIN_COMMANDS = [BotCommand(command="chats", description="Группы бота: разрешить / отключить")]
 
 log = logging.getLogger("repbot")
 
@@ -49,11 +51,11 @@ async def wait_telegram(bot: Bot, attempts: int = 10):
             await asyncio.sleep(5)
 
 
-async def log_chat_status(bot: Bot, chat_ids: frozenset[int]) -> None:
+async def log_chat_status(bot: Bot, chat_ids: list[int]) -> None:
     if not chat_ids:
         log.warning(
-            "ALLOWED_CHAT_ID не задан — бот не работает ни в одной группе. Добавьте бота в свою группу, "
-            "напишите там /chatid и укажите полученный ID в настройках хостинга"
+            "Нет разрешённых групп. Добавьте бота в группу — администратору бота в личку придёт "
+            "запрос с кнопками. Администратор должен заранее открыть бота в личке и нажать «Start»"
         )
         return
     for chat_id in chat_ids:
@@ -61,7 +63,7 @@ async def log_chat_status(bot: Bot, chat_ids: frozenset[int]) -> None:
             for ok, text in await check_rights(bot, chat_id):
                 (log.info if ok else log.warning)("[чат %s] %s", chat_id, text)
         except TelegramAPIError as e:
-            log.warning("Нет доступа к чату %s из ALLOWED_CHAT_ID (%s) — бот добавлен в эту группу?", chat_id, e.message)
+            log.warning("Нет доступа к группе %s (%s) — бот добавлен в эту группу?", chat_id, e.message)
 
 
 async def main() -> None:
@@ -71,6 +73,7 @@ async def main() -> None:
     await connect_db(db)
     log.info("База данных: %s", "PostgreSQL" if config.database_url else config.db_path)
     await importer.load(db, config.tag_format)
+    await access.load(db, config.allowed_chat_ids)
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(db=db, config=config)
@@ -85,7 +88,12 @@ async def main() -> None:
         await bot.delete_webhook()
         await bot.set_my_commands(COMMANDS, scope=BotCommandScopeDefault())
         await bot.set_my_commands(COMMANDS, scope=BotCommandScopeAllGroupChats())
-        await log_chat_status(bot, config.allowed_chat_ids)
+        for admin_id in config.admin_ids:
+            try:
+                await bot.set_my_commands(COMMANDS + ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id))
+            except TelegramAPIError:
+                pass  # админ ещё не открывал бота в личке
+        await log_chat_status(bot, access.allowed_ids())
         # chat_member нужен, чтобы точно знать дату вступления в группу
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:

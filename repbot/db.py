@@ -46,6 +46,15 @@ SCHEMA = [
         PRIMARY KEY (chat_id, username)
     )
     """,
+    # группы и решение администратора бота: allowed / denied / pending
+    """
+    CREATE TABLE IF NOT EXISTS chats (
+        chat_id    BIGINT PRIMARY KEY,
+        title      TEXT NOT NULL DEFAULT '',
+        status     TEXT NOT NULL,
+        updated_at BIGINT NOT NULL
+    )
+    """,
 ]
 
 
@@ -271,3 +280,26 @@ class Database:
             chat_id,
         )
         return [(r[0], r[1]) for r in rows]
+
+    # ---------- доступ групп ----------
+
+    async def set_chat_status(self, chat_id: int, title: str, status: str) -> None:
+        await self.execute(
+            """
+            INSERT INTO chats (chat_id, title, status, updated_at) VALUES (?, ?, ?, ?)
+            ON CONFLICT (chat_id) DO UPDATE SET
+                title = excluded.title, status = excluded.status, updated_at = excluded.updated_at
+            """,
+            chat_id, title, status, int(time.time()),
+        )
+
+    async def all_chats(self) -> list[tuple[int, str, str]]:
+        rows = await self.fetchall("SELECT chat_id, title, status FROM chats ORDER BY updated_at DESC")
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    async def migrate_chat(self, old_id: int, new_id: int) -> None:
+        """Группа стала супергруппой и получила новый ID — переносим все данные."""
+        if await self.fetchone("SELECT 1 FROM users WHERE chat_id = ? LIMIT 1", new_id) is None:
+            await self.execute("UPDATE users SET chat_id = ? WHERE chat_id = ?", new_id, old_id)
+        await self.execute("UPDATE rep_log SET chat_id = ? WHERE chat_id = ?", new_id, old_id)
+        await self.execute("UPDATE rep_import SET chat_id = ? WHERE chat_id = ?", new_id, old_id)

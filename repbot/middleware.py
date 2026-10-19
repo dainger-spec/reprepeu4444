@@ -2,9 +2,9 @@ import logging
 from typing import Any, Awaitable, Callable
 
 from aiogram import BaseMiddleware, Bot
-from aiogram.exceptions import TelegramAPIError
 from aiogram.types import Chat, Message, Update, User
 
+from .access import access, request_access
 from .config import Config
 from .db import Database
 from .importer import importer
@@ -34,9 +34,8 @@ class CountMessagesMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         user = event.from_user
-        config: Config = data["config"]
         if (
-            event.chat.id in config.allowed_chat_ids
+            access.is_allowed(event.chat.id)
             and user is not None
             and not user.is_bot
             and event.sender_chat is None
@@ -55,14 +54,11 @@ class CountMessagesMiddleware(BaseMiddleware):
 
 
 class AllowedChatMiddleware(BaseMiddleware):
-    """Бот работает только в своих группах (ALLOWED_CHAT_ID), из остальных выходит.
+    """Бот работает только в разрешённых группах (см. access.py).
 
-    В личке отвечает как обычно (/start, /help). Команда /chatid администратора
-    бота работает в любой группе — чтобы узнать ID для настройки.
+    Новая группа → запрос администратору бота с кнопками, пока решения нет — бот молчит.
+    В личке отвечает как обычно. Команда /chatid администратора бота работает в любой группе.
     """
-
-    def __init__(self) -> None:
-        self._warned: set[int] = set()
 
     async def __call__(
         self,
@@ -73,17 +69,20 @@ class AllowedChatMiddleware(BaseMiddleware):
         chat: Chat | None = data.get("event_chat")
         if chat is None or chat.type == "private":
             return await handler(event, data)
+        if chat.type not in ("group", "supergroup"):
+            return None  # каналы не обслуживаем
 
-        config: Config = data["config"]
         msg = event.message
-        if chat.id in config.allowed_chat_ids:
-            if msg is not None and msg.migrate_to_chat_id:
-                log.error(
-                    "Группа %s стала супергруппой и сменила ID на %s — замените его в ALLOWED_CHAT_ID "
-                    "в настройках хостинга и перезапустите бота", chat.id, msg.migrate_to_chat_id,
-                )
+        if msg is not None and msg.migrate_to_chat_id:
+            await access.migrate(chat.id, msg.migrate_to_chat_id, chat.title)
+        if msg is not None and msg.migrate_from_chat_id:
+            await access.migrate(msg.migrate_from_chat_id, chat.id, chat.title)
+
+        if access.is_allowed(chat.id):
+            access.remember_title(chat.id, chat.title)
             return await handler(event, data)
 
+        config: Config = data["config"]
         user: User | None = data.get("event_from_user")
         if (
             msg is not None
@@ -94,29 +93,17 @@ class AllowedChatMiddleware(BaseMiddleware):
         ):
             return await handler(event, data)
 
+        bot: Bot = data["bot"]
         mcm = event.my_chat_member
-        if mcm is not None and mcm.new_chat_member.status in ("member", "administrator"):
-            log.warning("Бота добавили в чат «%s» (id %s)", chat.title, chat.id)
-            if config.allowed_chat_ids:
-                # чужой чат — вежливо выходим
-                bot: Bot = data["bot"]
-                try:
-                    await bot.send_message(chat.id, "Этот бот работает только в своей группе.")
-                    await bot.leave_chat(chat.id)
-                except TelegramAPIError as e:
-                    log.warning("Не удалось выйти из чата %s: %s", chat.id, e)
-                return None
+        if mcm is not None:
+            added = (mcm.new_chat_member.status in ("member", "administrator")
+                     and mcm.old_chat_member.status in ("left", "kicked"))
+            if added:
+                # каждое новое добавление — новый запрос, даже если раньше отклоняли
+                await request_access(bot, config.admin_ids, chat, mcm.from_user)
+            return None
 
-        if chat.id not in self._warned:
-            self._warned.add(chat.id)
-            if not config.allowed_chat_ids:
-                log.warning(
-                    "ALLOWED_CHAT_ID не задан — бот нигде не работает. Если чат «%s» ваш, укажите "
-                    "ALLOWED_CHAT_ID=%s в настройках хостинга и перезапустите бота", chat.title, chat.id,
-                )
-            else:
-                log.warning(
-                    "Чат «%s» (id %s) игнорируется: бот работает только в чатах %s",
-                    chat.title, chat.id, ", ".join(map(str, sorted(config.allowed_chat_ids))),
-                )
+        if access.status(chat.id) is None:
+            # бот уже был в группе, но о ней ещё не спрашивали
+            await request_access(bot, config.admin_ids, chat, None)
         return None

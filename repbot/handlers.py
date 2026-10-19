@@ -9,6 +9,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
+    CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -16,6 +17,7 @@ from aiogram.types import (
     User,
 )
 
+from .access import ALLOWED, DENIED, access, chats_list
 from .avatars import get_avatars
 from .config import Config
 from .db import Database, Member
@@ -46,6 +48,7 @@ HELP_TEXT = (
 
 ADMIN_HELP_TEXT = (
     "\n\n<b>Для администратора бота:</b>\n"
+    "/chats — группы бота: разрешить или отключить (в личке)\n"
     "/null — обнулить репутацию и запретить пользоваться ботом (в ответ или <code>/null @username</code>)\n"
     "/unnull — снять запрет\n"
     "/setrep N — установить репутацию (в ответ или <code>/setrep @username N</code>)\n"
@@ -127,10 +130,12 @@ def fmt_date(ts: int, config: Config) -> str:
 @router.message(CommandStart(), F.chat.type == "private")
 async def cmd_start(message: Message, bot: Bot, config: Config) -> None:
     me = await bot.me()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="➕ Добавить в группу", url=f"https://t.me/{me.username}?startgroup=true")
-    ]])
-    await message.answer(HELP_TEXT.format(limit=config.daily_rep_limit), reply_markup=kb)
+    rows = [[InlineKeyboardButton(text="➕ Добавить в группу", url=f"https://t.me/{me.username}?startgroup=true")]]
+    text = HELP_TEXT.format(limit=config.daily_rep_limit)
+    if message.from_user and message.from_user.id in config.admin_ids:
+        rows.append([InlineKeyboardButton(text="⚙️ Группы бота", callback_data="chats:list")])
+        text += ADMIN_HELP_TEXT
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @router.message(Command("help", "start"))
@@ -346,14 +351,10 @@ async def cmd_chatid(message: Message, config: Config) -> None:
     if message.from_user is None or message.from_user.id not in config.admin_ids:
         return
     chat = message.chat
-    if chat.id in config.allowed_chat_ids:
-        status = "✅ Это рабочий чат бота."
+    if access.is_allowed(chat.id):
+        status = "✅ Бот работает в этой группе."
     else:
-        ids = ",".join(map(str, [*sorted(config.allowed_chat_ids), chat.id]))
-        status = (
-            "Бот здесь не работает. Чтобы он работал в этом чате, укажите в настройках хостинга\n"
-            f"<code>ALLOWED_CHAT_ID={ids}</code>\nи перезапустите бота."
-        )
+        status = "Бот здесь не работает. Разрешить группу можно в личке с ботом: /chats"
     await message.reply(f"ID этого чата: <code>{chat.id}</code>\n\n{status}")
 
 
@@ -403,3 +404,71 @@ async def cmd_importrep(message: Message, bot: Bot, config: Config) -> None:
             + "\nРепутация начислится автоматически, как только они напишут в группе."
         )
     await message.reply("\n".join(lines))
+
+
+# ---------- доступ групп (кнопки в личке администратора бота) ----------
+
+@router.message(Command("chats"), F.chat.type == "private")
+async def cmd_chats(message: Message, config: Config) -> None:
+    if message.from_user is None or message.from_user.id not in config.admin_ids:
+        return
+    text, kb = chats_list(access)
+    await message.answer(text, reply_markup=kb)
+
+
+def _rights_text(report: list[tuple[bool, str]]) -> str:
+    return "\n".join(("✅ " if ok else "❌ ") + escape(text) for ok, text in report)
+
+
+@router.callback_query(F.data.startswith("chat"))
+async def on_chat_button(cb: CallbackQuery, bot: Bot, config: Config) -> None:
+    if cb.from_user.id not in config.admin_ids:
+        await cb.answer("Только для администратора бота", show_alert=True)
+        return
+
+    if cb.data == "chats:list":
+        text, kb = chats_list(access)
+        await bot.send_message(cb.from_user.id, text, reply_markup=kb)
+        await cb.answer()
+        return
+
+    _, action, raw_id, *rest = cb.data.split(":")
+    chat_id, from_list = int(raw_id), rest == ["list"]
+    title = escape(access.title(chat_id))
+
+    if action == "allow":
+        was_allowed = access.is_allowed(chat_id)
+        await access.set(chat_id, ALLOWED)
+        result = f"✅ Группа «{title}» разрешена"
+        if not was_allowed:
+            try:
+                report = await check_rights(bot, chat_id)
+                await bot.send_message(
+                    chat_id,
+                    "✅ Доступ разрешён — теперь я работаю в этой группе. Справка: /help\n\n"
+                    "<b>Проверка прав:</b>\n" + _rights_text(report),
+                )
+                if not all(ok for ok, _ in report):
+                    result += "\n⚠️ Не хватает прав — подробности отправлены в группу"
+            except TelegramAPIError:
+                result += "\n⚠️ Бота сейчас нет в этой группе — добавьте его снова"
+    else:
+        await access.set(chat_id, DENIED)
+        try:
+            await bot.send_message(chat_id, "Администратор бота не разрешил работу в этой группе. До свидания!")
+            await bot.leave_chat(chat_id)
+        except TelegramAPIError:
+            pass
+        result = f"❌ Группа «{title}» отключена, бот вышел из неё"
+
+    await cb.answer(result.split("\n")[0].replace("&quot;", '"'))
+    if not isinstance(cb.message, Message):
+        return  # сообщение старше 48 часов — Telegram не даёт его менять
+    try:
+        if from_list:
+            text, kb = chats_list(access)
+            await cb.message.edit_text(text, reply_markup=kb)
+        else:
+            await cb.message.edit_text(cb.message.html_text + "\n\n" + result, reply_markup=None)
+    except TelegramAPIError:
+        pass
