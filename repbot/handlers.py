@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import time
-from datetime import datetime
 from html import escape
 
 from aiogram import Bot, F, Router
@@ -18,11 +17,12 @@ from aiogram.types import (
 )
 
 from .access import ALLOWED, DENIED, access, chats_list
-from .avatars import get_avatars
+from .avatars import get_avatar, get_avatars
 from .config import Config
 from .db import Database, Member
 from .importer import IMPORT_FILE, importer
 from .tags import apply_tag, check_rights, make_tag
+from .profile_image import render_profile
 from .top_image import render_top
 
 log = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ GROUP_HELP_TEXT = (
     "<b>Команды:</b>\n"
     "/profile — карточка профиля (ник, репутация, сообщения, дата входа). "
     "Можно в ответ на сообщение или <code>/profile @username</code>\n"
-    "/top — таблица топ-15 репутации картинкой\n"
+    "/top — таблица топ-15 репутации\n"
     "/help — справка"
 )
 
@@ -126,10 +126,6 @@ async def deny_if_banned(message: Message, db: Database) -> bool:
     return False
 
 
-def fmt_date(ts: int, config: Config) -> str:
-    return datetime.fromtimestamp(ts, config.tz).strftime("%d.%m.%Y")
-
-
 # ---------- общие команды ----------
 
 @router.message(CommandStart(), F.chat.type == "private")
@@ -156,7 +152,7 @@ async def cmd_help(message: Message, config: Config) -> None:
 
 
 @router.message(Command("profile"), group_only)
-async def cmd_profile(message: Message, command: CommandObject, db: Database, config: Config) -> None:
+async def cmd_profile(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config) -> None:
     if await deny_if_banned(message, db):
         return
     target, _, error = await resolve_target(message, command, db)
@@ -170,17 +166,13 @@ async def cmd_profile(message: Message, command: CommandObject, db: Database, co
         return
 
     place = await db.place(message.chat.id, target.rep)
-    lines = [
-        f"👤 <b>{escape(target.display_name)}</b>",
-        f"🔗 @{escape(target.username)}" if target.username else f"🆔 <code>{target.user_id}</code>",
-        "",
-        f"⭐ Репутация: <b>{target.rep}</b>" + ("" if target.banned else f" (место #{place})"),
-        f"💬 Сообщений: <b>{target.messages}</b>",
-        f"📅 В группе с: <b>{fmt_date(target.joined_at, config)}</b>",
-    ]
-    if target.banned:
-        lines.append("\n⛔ Доступ к боту заблокирован")
-    await message.reply("\n".join(lines))
+    total = await db.member_count(message.chat.id)
+    photo = await get_avatar(bot, target.user_id)
+    png = await asyncio.to_thread(
+        render_profile, target, place, total, make_tag(config.tag_format, target.rep),
+        message.chat.title or "", photo, config.tz,
+    )
+    await message.reply_photo(BufferedInputFile(png, filename="profile.png"))
 
 
 @router.message(Command("top"), group_only)
@@ -210,27 +202,44 @@ def is_plus_rep(text: str | None) -> bool:
     return False
 
 
+async def rep_target(message: Message, bot: Bot, db: Database) -> tuple[Member | None, str | None]:
+    """Кому +rep: ответом на сообщение, упоминанием из списка участников или @username."""
+    user = replied_user(message)
+    if user is None:
+        for entity in message.entities or []:
+            if entity.type == "text_mention" and entity.user:
+                user = entity.user  # упомянули человека без ника
+                break
+            if entity.type == "mention":
+                username = entity.extract_from(message.text)
+                member = await db.find_by_username(message.chat.id, username)
+                if member is None:
+                    return None, f"Не знаю участника {escape(username)} — он ещё ничего не писал в этом чате."
+                return member, None
+    if user is None:
+        return None, "Чтобы выдать +rep, ответьте на сообщение участника или напишите <code>+rep @username</code>."
+    if user.is_bot:
+        return None, "Ботам репутацию не выдают 🙂"
+    return await ensure_member(db, bot, message.chat.id, user), None
+
+
 @router.message(group_only, F.text.func(is_plus_rep))
 async def plus_rep(message: Message, bot: Bot, db: Database, config: Config) -> None:
     giver = message.from_user
     if giver is None or giver.is_bot or message.sender_chat is not None:
-        return
-    target_user = replied_user(message)
-    if target_user is None:
-        await message.reply("Чтобы выдать +rep, ответьте на сообщение участника.")
-        return
-    if target_user.is_bot:
-        await message.reply("Ботам репутацию не выдают 🙂")
-        return
-    if target_user.id == giver.id:
-        await message.reply("Себе репутацию поднять нельзя.")
         return
     if await deny_if_banned(message, db):
         return
 
     chat_id = message.chat.id
     async with rep_lock:
-        target = await ensure_member(db, bot, chat_id, target_user)
+        target, error = await rep_target(message, bot, db)
+        if error:
+            await message.reply(error)
+            return
+        if target.user_id == giver.id:
+            await message.reply("Себе репутацию поднять нельзя.")
+            return
         if target.banned:
             await message.reply("Этому участнику запрещено пользоваться ботом — репутацию ему выдать нельзя.")
             return

@@ -126,7 +126,7 @@ def _avatar(m: Member, photo: bytes | None, size: int) -> Image.Image:
     color = AVATAR_COLORS[m.user_id % len(AVATAR_COLORS)]
     img = Image.new("RGB", (size, size), color)
     letter = _display(m)[:1].upper()
-    f = font("SemiBold", AVATAR // 2 - 2)
+    f = font("SemiBold", size // S // 2 - 2)
     if not _has_glyph(f, letter):
         f = _fallback(f.size)
     ImageDraw.Draw(img).text((size / 2, size / 2), letter, font=f, fill=(255, 255, 255), anchor="mm")

@@ -210,6 +210,10 @@ class Database:
         )
         return row[0] + 1
 
+    async def member_count(self, chat_id: int) -> int:
+        row = await self.fetchone("SELECT COUNT(*) FROM users WHERE chat_id = ? AND banned = 0", chat_id)
+        return row[0]
+
     async def add_rep(self, chat_id: int, user_id: int, delta: int) -> int:
         await self.execute(
             "UPDATE users SET rep = rep + ? WHERE chat_id = ? AND user_id = ?",
