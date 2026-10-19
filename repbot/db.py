@@ -36,6 +36,16 @@ SCHEMA = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS rep_log_from ON rep_log (chat_id, from_id, ts)",
+    # перенесённая репутация: начисляется, когда человек с этим ником появится в чате
+    """
+    CREATE TABLE IF NOT EXISTS rep_import (
+        chat_id    BIGINT NOT NULL,
+        username   TEXT NOT NULL,
+        rep        BIGINT NOT NULL,
+        applied_to BIGINT,
+        PRIMARY KEY (chat_id, username)
+    )
+    """,
 ]
 
 
@@ -228,3 +238,36 @@ class Database:
         )
         # старые записи для лимита больше не нужны
         await self.execute("DELETE FROM rep_log WHERE ts < ?", now - 7 * 86400)
+
+    # ---------- перенос репутации ----------
+
+    async def add_import(self, chat_id: int, username: str, rep: int) -> bool:
+        """Добавляет запись переноса. False — такая уже была (повторный импорт)."""
+        if await self.fetchone(
+            "SELECT 1 FROM rep_import WHERE chat_id = ? AND username = ?", chat_id, username
+        ):
+            return False
+        await self.execute(
+            "INSERT INTO rep_import (chat_id, username, rep) VALUES (?, ?, ?)",
+            chat_id, username, rep,
+        )
+        return True
+
+    async def pending_imports(self) -> list[tuple[int, str, int]]:
+        rows = await self.fetchall(
+            "SELECT chat_id, username, rep FROM rep_import WHERE applied_to IS NULL"
+        )
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    async def mark_import_applied(self, chat_id: int, username: str, user_id: int) -> None:
+        await self.execute(
+            "UPDATE rep_import SET applied_to = ? WHERE chat_id = ? AND username = ?",
+            user_id, chat_id, username,
+        )
+
+    async def users_with_username(self, chat_id: int) -> list[tuple[int, str]]:
+        rows = await self.fetchall(
+            "SELECT user_id, username FROM users WHERE chat_id = ? AND username IS NOT NULL",
+            chat_id,
+        )
+        return [(r[0], r[1]) for r in rows]

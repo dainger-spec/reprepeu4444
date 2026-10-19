@@ -7,6 +7,7 @@ from aiogram.types import Chat, Message, Update, User
 
 from .config import Config
 from .db import Database
+from .importer import importer
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +36,7 @@ class CountMessagesMiddleware(BaseMiddleware):
         user = event.from_user
         config: Config = data["config"]
         if (
-            event.chat.id == config.allowed_chat_id
+            event.chat.id in config.allowed_chat_ids
             and user is not None
             and not user.is_bot
             and event.sender_chat is None
@@ -49,11 +50,12 @@ class CountMessagesMiddleware(BaseMiddleware):
                 count_message=event.content_type not in SERVICE_TYPES,
                 joined_at=int(event.date.timestamp()),
             )
+            await importer.match(data["bot"], event.chat.id, user.id, user.username)
         return await handler(event, data)
 
 
 class AllowedChatMiddleware(BaseMiddleware):
-    """Бот работает только в одной группе (ALLOWED_CHAT_ID), из остальных выходит.
+    """Бот работает только в своих группах (ALLOWED_CHAT_ID), из остальных выходит.
 
     В личке отвечает как обычно (/start, /help). Команда /chatid администратора
     бота работает в любой группе — чтобы узнать ID для настройки.
@@ -74,11 +76,11 @@ class AllowedChatMiddleware(BaseMiddleware):
 
         config: Config = data["config"]
         msg = event.message
-        if config.allowed_chat_id is not None and chat.id == config.allowed_chat_id:
+        if chat.id in config.allowed_chat_ids:
             if msg is not None and msg.migrate_to_chat_id:
                 log.error(
-                    "Группа стала супергруппой и сменила ID: укажите ALLOWED_CHAT_ID=%s "
-                    "в настройках хостинга и перезапустите бота", msg.migrate_to_chat_id,
+                    "Группа %s стала супергруппой и сменила ID на %s — замените его в ALLOWED_CHAT_ID "
+                    "в настройках хостинга и перезапустите бота", chat.id, msg.migrate_to_chat_id,
                 )
             return await handler(event, data)
 
@@ -95,7 +97,7 @@ class AllowedChatMiddleware(BaseMiddleware):
         mcm = event.my_chat_member
         if mcm is not None and mcm.new_chat_member.status in ("member", "administrator"):
             log.warning("Бота добавили в чат «%s» (id %s)", chat.title, chat.id)
-            if config.allowed_chat_id is not None:
+            if config.allowed_chat_ids:
                 # чужой чат — вежливо выходим
                 bot: Bot = data["bot"]
                 try:
@@ -107,14 +109,14 @@ class AllowedChatMiddleware(BaseMiddleware):
 
         if chat.id not in self._warned:
             self._warned.add(chat.id)
-            if config.allowed_chat_id is None:
+            if not config.allowed_chat_ids:
                 log.warning(
                     "ALLOWED_CHAT_ID не задан — бот нигде не работает. Если чат «%s» ваш, укажите "
                     "ALLOWED_CHAT_ID=%s в настройках хостинга и перезапустите бота", chat.title, chat.id,
                 )
             else:
                 log.warning(
-                    "Чат «%s» (id %s) игнорируется: бот работает только в чате %s",
-                    chat.title, chat.id, config.allowed_chat_id,
+                    "Чат «%s» (id %s) игнорируется: бот работает только в чатах %s",
+                    chat.title, chat.id, ", ".join(map(str, sorted(config.allowed_chat_ids))),
                 )
         return None

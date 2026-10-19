@@ -19,6 +19,7 @@ from aiogram.types import (
 from .avatars import get_avatars
 from .config import Config
 from .db import Database, Member
+from .importer import IMPORT_FILE, importer
 from .tags import apply_tag, check_rights, make_tag
 from .top_image import render_top
 
@@ -50,6 +51,7 @@ ADMIN_HELP_TEXT = (
     "/setrep N — установить репутацию (в ответ или <code>/setrep @username N</code>)\n"
     "/addrep N — прибавить/отнять репутацию (N может быть отрицательным)\n"
     "/check — проверить, хватает ли боту прав для плашек\n"
+    "/importrep — перенести репутацию из rep_import.csv в эту группу (один раз)\n"
     "/chatid — узнать ID чата (для ALLOWED_CHAT_ID)"
 )
 
@@ -73,8 +75,9 @@ def mention(m: Member) -> str:
     return f'<a href="tg://user?id={m.user_id}">{escape(m.display_name)}</a>'
 
 
-async def ensure_member(db: Database, chat_id: int, user: User) -> Member:
+async def ensure_member(db: Database, bot: Bot, chat_id: int, user: User) -> Member:
     await db.touch(chat_id, user.id, user.username, user.full_name, count_message=False)
+    await importer.match(bot, chat_id, user.id, user.username)
     return await db.get(chat_id, user.id)
 
 
@@ -90,7 +93,7 @@ async def resolve_target(
     if reply_user is not None and not (args and args[0].startswith("@")):
         if reply_user.is_bot:
             return None, args, "Это бот — у ботов нет профиля."
-        return await ensure_member(db, message.chat.id, reply_user), args, None
+        return await ensure_member(db, message.bot, message.chat.id, reply_user), args, None
 
     if args and args[0].startswith("@"):
         member = await db.find_by_username(message.chat.id, args[0])
@@ -213,7 +216,7 @@ async def plus_rep(message: Message, bot: Bot, db: Database, config: Config) -> 
 
     chat_id = message.chat.id
     async with rep_lock:
-        target = await ensure_member(db, chat_id, target_user)
+        target = await ensure_member(db, bot, chat_id, target_user)
         if target.banned:
             await message.reply("Этому участнику запрещено пользоваться ботом — репутацию ему выдать нельзя.")
             return
@@ -244,23 +247,25 @@ async def plus_rep(message: Message, bot: Bot, db: Database, config: Config) -> 
 # ---------- вступление в группу ----------
 
 @router.chat_member(ChatMemberUpdatedFilter(JOIN_TRANSITION))
-async def on_join(event: ChatMemberUpdated, db: Database) -> None:
+async def on_join(event: ChatMemberUpdated, bot: Bot, db: Database) -> None:
     user = event.new_chat_member.user
     if user.is_bot:
         return
     ts = int(event.date.timestamp())
     await db.touch(event.chat.id, user.id, user.username, user.full_name, count_message=False, joined_at=ts)
     await db.set_joined(event.chat.id, user.id, ts)
+    await importer.match(bot, event.chat.id, user.id, user.username)
 
 
 @router.message(group_only, F.new_chat_members)
-async def on_new_members(message: Message, db: Database) -> None:
+async def on_new_members(message: Message, bot: Bot, db: Database) -> None:
     ts = int(message.date.timestamp())
     for user in message.new_chat_members:
         if user.is_bot:
             continue
         await db.touch(message.chat.id, user.id, user.username, user.full_name, count_message=False, joined_at=ts)
         await db.set_joined(message.chat.id, user.id, ts)
+        await importer.match(bot, message.chat.id, user.id, user.username)
 
 
 # ---------- команды администратора бота ----------
@@ -341,12 +346,13 @@ async def cmd_chatid(message: Message, config: Config) -> None:
     if message.from_user is None or message.from_user.id not in config.admin_ids:
         return
     chat = message.chat
-    if chat.id == config.allowed_chat_id:
+    if chat.id in config.allowed_chat_ids:
         status = "✅ Это рабочий чат бота."
     else:
+        ids = ",".join(map(str, [*sorted(config.allowed_chat_ids), chat.id]))
         status = (
             "Бот здесь не работает. Чтобы он работал в этом чате, укажите в настройках хостинга\n"
-            f"<code>ALLOWED_CHAT_ID={chat.id}</code>\nи перезапустите бота."
+            f"<code>ALLOWED_CHAT_ID={ids}</code>\nи перезапустите бота."
         )
     await message.reply(f"ID этого чата: <code>{chat.id}</code>\n\n{status}")
 
@@ -373,3 +379,27 @@ async def on_bot_status(event: ChatMemberUpdated, bot: Bot) -> None:
         report = await check_rights(bot, event.chat.id)
         lines = [("✅ " if ok else "❌ ") + escape(text) for ok, text in report]
         await bot.send_message(event.chat.id, "<b>Меня сделали админом. Проверка прав:</b>\n\n" + "\n".join(lines))
+
+
+@router.message(Command("importrep"), group_only)
+async def cmd_importrep(message: Message, bot: Bot, config: Config) -> None:
+    if message.from_user is None or message.from_user.id not in config.admin_ids:
+        return
+    try:
+        async with rep_lock:
+            added, skipped, applied = await importer.import_file(bot, message.chat.id)
+    except (OSError, ValueError) as e:
+        await message.reply(f"Не удалось прочитать {IMPORT_FILE.name}: {escape(str(e))}")
+        return
+    waiting = importer.waiting(message.chat.id)
+    lines = [f"📥 Перенос репутации в эту группу: новых записей <b>{added}</b>"]
+    if skipped:
+        lines.append(f"Уже были загружены раньше: {skipped} (повторно не начисляются)")
+    lines.append(f"Начислено сразу: <b>{applied}</b>")
+    if waiting:
+        lines.append(
+            f"Ждут первого сообщения ({len(waiting)}): "
+            + ", ".join("@" + escape(u.replace("*", "…")) for u in waiting)
+            + "\nРепутация начислится автоматически, как только они напишут в группе."
+        )
+    await message.reply("\n".join(lines))
