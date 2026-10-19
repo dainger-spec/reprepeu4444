@@ -4,13 +4,14 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from aiogram.exceptions import TelegramNetworkError, TelegramUnauthorizedError
+from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeDefault
 
 from repbot.config import ConfigError, load_config
 from repbot.db import Database
 from repbot.handlers import router
-from repbot.middleware import CountMessagesMiddleware
+from repbot.middleware import AllowedChatMiddleware, CountMessagesMiddleware
+from repbot.tags import check_rights
 
 COMMANDS = [
     BotCommand(command="profile", description="Карточка профиля"),
@@ -46,6 +47,20 @@ async def wait_telegram(bot: Bot, attempts: int = 10):
             await asyncio.sleep(5)
 
 
+async def log_chat_status(bot: Bot, chat_id: int | None) -> None:
+    if chat_id is None:
+        log.warning(
+            "ALLOWED_CHAT_ID не задан — бот не работает ни в одной группе. Добавьте бота в свою группу, "
+            "напишите там /chatid и укажите полученный ID в настройках хостинга"
+        )
+        return
+    try:
+        for ok, text in await check_rights(bot, chat_id):
+            (log.info if ok else log.warning)("[рабочий чат] %s", text)
+    except TelegramAPIError as e:
+        log.warning("Нет доступа к чату ALLOWED_CHAT_ID=%s (%s) — бот добавлен в эту группу?", chat_id, e.message)
+
+
 async def main() -> None:
     config = load_config()
 
@@ -55,6 +70,7 @@ async def main() -> None:
 
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode="HTML"))
     dp = Dispatcher(db=db, config=config)
+    dp.update.outer_middleware(AllowedChatMiddleware())
     dp.message.outer_middleware(CountMessagesMiddleware())
     dp.include_router(router)
 
@@ -65,6 +81,7 @@ async def main() -> None:
         await bot.delete_webhook()
         await bot.set_my_commands(COMMANDS, scope=BotCommandScopeDefault())
         await bot.set_my_commands(COMMANDS, scope=BotCommandScopeAllGroupChats())
+        await log_chat_status(bot, config.allowed_chat_id)
         # chat_member нужен, чтобы точно знать дату вступления в группу
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:

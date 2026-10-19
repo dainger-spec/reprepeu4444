@@ -49,6 +49,7 @@ def _parse_ids(raw: str) -> frozenset[int]:
 class Config:
     bot_token: str
     admin_ids: frozenset[int]
+    allowed_chat_id: int | None
     database_url: str | None
     db_path: Path
     daily_rep_limit: int
@@ -81,6 +82,12 @@ def load_config() -> Config:
         admin_ids = _parse_ids(os.getenv("ADMIN_IDS", "1457986905"))
     except ValueError:
         raise ConfigError("ADMIN_IDS должен быть списком числовых ID через запятую") from None
+    raw_chat = os.getenv("ALLOWED_CHAT_ID", "").strip()
+    try:
+        allowed_chat_id = int(raw_chat) if raw_chat else None
+    except ValueError:
+        raise ConfigError("ALLOWED_CHAT_ID должен быть числом, например -1001234567890 (узнать: /chatid в группе)") from None
+
     try:
         daily_rep_limit = int(os.getenv("DAILY_REP_LIMIT", "3"))
     except ValueError:
@@ -93,6 +100,7 @@ def load_config() -> Config:
     return Config(
         bot_token=token,
         admin_ids=admin_ids,
+        allowed_chat_id=allowed_chat_id,
         database_url=database_url,
         db_path=db_path,
         daily_rep_limit=daily_rep_limit,

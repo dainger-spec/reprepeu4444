@@ -1,9 +1,14 @@
+import logging
 from typing import Any, Awaitable, Callable
 
-from aiogram import BaseMiddleware
-from aiogram.types import Message
+from aiogram import BaseMiddleware, Bot
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import Chat, Message, Update, User
 
+from .config import Config
 from .db import Database
+
+log = logging.getLogger(__name__)
 
 # служебные сообщения не считаем как написанные
 SERVICE_TYPES = {
@@ -28,8 +33,9 @@ class CountMessagesMiddleware(BaseMiddleware):
         data: dict[str, Any],
     ) -> Any:
         user = event.from_user
+        config: Config = data["config"]
         if (
-            event.chat.type in ("group", "supergroup")
+            event.chat.id == config.allowed_chat_id
             and user is not None
             and not user.is_bot
             and event.sender_chat is None
@@ -44,3 +50,71 @@ class CountMessagesMiddleware(BaseMiddleware):
                 joined_at=int(event.date.timestamp()),
             )
         return await handler(event, data)
+
+
+class AllowedChatMiddleware(BaseMiddleware):
+    """Бот работает только в одной группе (ALLOWED_CHAT_ID), из остальных выходит.
+
+    В личке отвечает как обычно (/start, /help). Команда /chatid администратора
+    бота работает в любой группе — чтобы узнать ID для настройки.
+    """
+
+    def __init__(self) -> None:
+        self._warned: set[int] = set()
+
+    async def __call__(
+        self,
+        handler: Callable[[Update, dict[str, Any]], Awaitable[Any]],
+        event: Update,
+        data: dict[str, Any],
+    ) -> Any:
+        chat: Chat | None = data.get("event_chat")
+        if chat is None or chat.type == "private":
+            return await handler(event, data)
+
+        config: Config = data["config"]
+        msg = event.message
+        if config.allowed_chat_id is not None and chat.id == config.allowed_chat_id:
+            if msg is not None and msg.migrate_to_chat_id:
+                log.error(
+                    "Группа стала супергруппой и сменила ID: укажите ALLOWED_CHAT_ID=%s "
+                    "в настройках хостинга и перезапустите бота", msg.migrate_to_chat_id,
+                )
+            return await handler(event, data)
+
+        user: User | None = data.get("event_from_user")
+        if (
+            msg is not None
+            and user is not None
+            and user.id in config.admin_ids
+            and msg.text
+            and msg.text.split()[0].split("@")[0].lower() == "/chatid"
+        ):
+            return await handler(event, data)
+
+        mcm = event.my_chat_member
+        if mcm is not None and mcm.new_chat_member.status in ("member", "administrator"):
+            log.warning("Бота добавили в чат «%s» (id %s)", chat.title, chat.id)
+            if config.allowed_chat_id is not None:
+                # чужой чат — вежливо выходим
+                bot: Bot = data["bot"]
+                try:
+                    await bot.send_message(chat.id, "Этот бот работает только в своей группе.")
+                    await bot.leave_chat(chat.id)
+                except TelegramAPIError as e:
+                    log.warning("Не удалось выйти из чата %s: %s", chat.id, e)
+                return None
+
+        if chat.id not in self._warned:
+            self._warned.add(chat.id)
+            if config.allowed_chat_id is None:
+                log.warning(
+                    "ALLOWED_CHAT_ID не задан — бот нигде не работает. Если чат «%s» ваш, укажите "
+                    "ALLOWED_CHAT_ID=%s в настройках хостинга и перезапустите бота", chat.title, chat.id,
+                )
+            else:
+                log.warning(
+                    "Чат «%s» (id %s) игнорируется: бот работает только в чате %s",
+                    chat.title, chat.id, config.allowed_chat_id,
+                )
+        return None

@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import time
 from datetime import datetime
 from html import escape
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -17,9 +19,10 @@ from aiogram.types import (
 from .avatars import get_avatars
 from .config import Config
 from .db import Database, Member
-from .tags import apply_tag, make_tag
+from .tags import apply_tag, check_rights, make_tag
 from .top_image import render_top
 
+log = logging.getLogger(__name__)
 router = Router()
 group_only = F.chat.type.in_({"group", "supergroup"})
 
@@ -45,7 +48,9 @@ ADMIN_HELP_TEXT = (
     "/null — обнулить репутацию и запретить пользоваться ботом (в ответ или <code>/null @username</code>)\n"
     "/unnull — снять запрет\n"
     "/setrep N — установить репутацию (в ответ или <code>/setrep @username N</code>)\n"
-    "/addrep N — прибавить/отнять репутацию (N может быть отрицательным)"
+    "/addrep N — прибавить/отнять репутацию (N может быть отрицательным)\n"
+    "/check — проверить, хватает ли боту прав для плашек\n"
+    "/chatid — узнать ID чата (для ALLOWED_CHAT_ID)"
 )
 
 
@@ -329,3 +334,42 @@ async def cmd_setrep(message: Message, command: CommandObject, bot: Bot, db: Dat
 @router.message(Command("addrep"), group_only)
 async def cmd_addrep(message: Message, command: CommandObject, bot: Bot, db: Database, config: Config) -> None:
     await _change_rep(message, command, bot, db, config, absolute=False)
+
+
+@router.message(Command("chatid"))
+async def cmd_chatid(message: Message, config: Config) -> None:
+    if message.from_user is None or message.from_user.id not in config.admin_ids:
+        return
+    chat = message.chat
+    if chat.id == config.allowed_chat_id:
+        status = "✅ Это рабочий чат бота."
+    else:
+        status = (
+            "Бот здесь не работает. Чтобы он работал в этом чате, укажите в настройках хостинга\n"
+            f"<code>ALLOWED_CHAT_ID={chat.id}</code>\nи перезапустите бота."
+        )
+    await message.reply(f"ID этого чата: <code>{chat.id}</code>\n\n{status}")
+
+
+@router.message(Command("check"), group_only)
+async def cmd_check(message: Message, bot: Bot, config: Config) -> None:
+    if message.from_user is None or message.from_user.id not in config.admin_ids:
+        return
+    try:
+        report = await check_rights(bot, message.chat.id)
+    except TelegramAPIError as e:
+        await message.reply(f"Не удалось проверить права: {escape(e.message)}")
+        return
+    lines = [("✅ " if ok else "❌ ") + escape(text) for ok, text in report]
+    await message.reply("<b>Проверка бота</b>\n\n" + "\n".join(lines))
+
+
+@router.my_chat_member()
+async def on_bot_status(event: ChatMemberUpdated, bot: Bot) -> None:
+    # сюда попадают только события из рабочего чата (остальные отсекает AllowedChatMiddleware)
+    status = event.new_chat_member.status
+    log.info("Статус бота в чате «%s» (id %s): %s", event.chat.title, event.chat.id, status)
+    if status == "administrator" and event.old_chat_member.status != "administrator":
+        report = await check_rights(bot, event.chat.id)
+        lines = [("✅ " if ok else "❌ ") + escape(text) for ok, text in report]
+        await bot.send_message(event.chat.id, "<b>Меня сделали админом. Проверка прав:</b>\n\n" + "\n".join(lines))
