@@ -14,6 +14,7 @@ from aiogram.types import (
     User,
 )
 
+from .avatars import get_avatars
 from .config import Config
 from .db import Database, Member
 from .tags import apply_tag, make_tag
@@ -161,11 +162,12 @@ async def cmd_profile(message: Message, command: CommandObject, db: Database, co
 
 
 @router.message(Command("top"), group_only)
-async def cmd_top(message: Message, db: Database) -> None:
+async def cmd_top(message: Message, bot: Bot, db: Database) -> None:
     if await deny_if_banned(message, db):
         return
     members = await db.top(message.chat.id, 15)
-    png = await asyncio.to_thread(render_top, message.chat.title or "", members)
+    avatars = await get_avatars(bot, [m.user_id for m in members])
+    png = await asyncio.to_thread(render_top, message.chat.title or "", members, avatars)
     await message.reply_photo(BufferedInputFile(png, filename="top.png"))
 
 

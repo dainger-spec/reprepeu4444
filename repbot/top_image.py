@@ -2,97 +2,189 @@
 
 import io
 import unicodedata
+from functools import lru_cache
 
 from PIL import Image, ImageDraw, ImageFont
 
 from .config import BASE_DIR
 from .db import Member
 
-FONT_REGULAR = BASE_DIR / "fonts" / "DejaVuSans.ttf"
-FONT_BOLD = BASE_DIR / "fonts" / "DejaVuSans-Bold.ttf"
+FONTS = BASE_DIR / "fonts"
+FALLBACK_FONT = FONTS / "DejaVuSans.ttf"  # для символов, которых нет в Inter
 
+S = 2  # рисуем в двойном разрешении, чтобы картинка была чёткой
 WIDTH = 900
-PAD = 40
-HEADER_H = 130
-COLS_H = 44
-ROW_H = 58
-FOOTER_H = 0
+PAD = 36
+HEADER_H = 128
+COLS_H = 40
+ROW_H = 64
+ROW_GAP = 6
+AVATAR = 40
 
-BG = (24, 26, 33)
-CARD = (33, 36, 46)
-CARD_ALT = (38, 42, 54)
-TEXT = (236, 238, 243)
-MUTED = (140, 146, 162)
-ACCENT = (120, 170, 255)
-MEDALS = {1: (255, 196, 61), 2: (196, 204, 216), 3: (214, 140, 82)}
+BG = (18, 20, 27)
+CARD = (29, 32, 42)
+CARD_ALT = (34, 38, 50)
+TEXT = (240, 242, 247)
+MUTED = (134, 141, 158)
+ACCENT = (110, 168, 255)
+MEDALS = {1: (255, 196, 61), 2: (200, 208, 220), 3: (222, 145, 86)}
+# цвета «пустых» аватарок как в Telegram
+AVATAR_COLORS = [
+    (229, 86, 86), (240, 150, 60), (150, 110, 230), (80, 185, 95),
+    (70, 175, 200), (80, 145, 230), (225, 100, 160),
+]
+
+
+@lru_cache(maxsize=None)
+def font(name: str, size: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(FONTS / f"Inter-{name}.ttf"), size * S)
+
+
+@lru_cache(maxsize=None)
+def _notdef(f: ImageFont.FreeTypeFont) -> bytes:
+    return bytes(f.getmask("\u0378"))  # неназначенный код — всегда «нет глифа»
+
+
+@lru_cache(maxsize=4096)
+def _has_glyph(f: ImageFont.FreeTypeFont, ch: str) -> bool:
+    return ch.isspace() or bytes(f.getmask(ch)) != _notdef(f)
+
+
+@lru_cache(maxsize=None)
+def _fallback(px: int) -> ImageFont.FreeTypeFont:
+    return ImageFont.truetype(str(FALLBACK_FONT), px)
+
+
+def _runs(text: str, f: ImageFont.FreeTypeFont) -> list[tuple[str, ImageFont.FreeTypeFont]]:
+    """Разбивает текст на куски: что есть в Inter — им, остальное — запасным шрифтом."""
+    fb = _fallback(f.size)
+    runs: list[tuple[str, ImageFont.FreeTypeFont]] = []
+    for ch in text:
+        cur = f if _has_glyph(f, ch) else fb
+        if runs and runs[-1][1] is cur:
+            runs[-1] = (runs[-1][0] + ch, cur)
+        else:
+            runs.append((ch, cur))
+    return runs
+
+
+def _width(d: ImageDraw.ImageDraw, text: str, f) -> float:
+    return sum(d.textlength(t, font=rf) for t, rf in _runs(text, f))
+
+
+def _draw_name(d: ImageDraw.ImageDraw, x: float, cy: float, text: str, f, fill) -> None:
+    for t, rf in _runs(text, f):
+        d.text((x, cy), t, font=rf, fill=fill, anchor="lm")
+        x += d.textlength(t, font=rf)
 
 
 def _clean(name: str) -> str:
-    """Убирает эмодзи и прочие символы, которых нет в шрифте."""
+    """Убирает эмодзи, служебные символы и то, чего нет ни в одном из шрифтов."""
+    main = font("Medium", 22)
+    fb = _fallback(main.size)
     out = []
     for ch in name:
         if ord(ch) > 0xFFFF or unicodedata.category(ch) in ("So", "Cs", "Co", "Cn", "Mn", "Cf"):
             continue
+        if not (_has_glyph(main, ch) or _has_glyph(fb, ch)):
+            continue
         out.append(ch)
-    return " ".join("".join(out).split()) or "Без имени"
+    return " ".join("".join(out).split())
 
 
-def _fit(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> str:
-    if draw.textlength(text, font=font) <= max_w:
+def _display(m: Member) -> str:
+    return _clean(m.display_name) or (f"@{m.username}" if m.username else f"id{m.user_id}")
+
+
+def _fit(d: ImageDraw.ImageDraw, text: str, f, max_w: float) -> str:
+    if _width(d, text, f) <= max_w:
         return text
-    while text and draw.textlength(text + "…", font=font) > max_w:
+    while text and _width(d, text + "…", f) > max_w:
         text = text[:-1]
-    return text + "…"
+    return text.rstrip() + "…"
 
 
-def render_top(chat_title: str, members: list[Member]) -> bytes:
+def _circle_mask(size: int) -> Image.Image:
+    big = Image.new("L", (size * 4, size * 4), 0)
+    ImageDraw.Draw(big).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
+    return big.resize((size, size), Image.LANCZOS)
+
+
+def _avatar(m: Member, photo: bytes | None, size: int) -> Image.Image:
+    if photo:
+        try:
+            img = Image.open(io.BytesIO(photo)).convert("RGB")
+            side = min(img.size)
+            left, top = (img.width - side) // 2, (img.height - side) // 2
+            return img.crop((left, top, left + side, top + side)).resize((size, size), Image.LANCZOS)
+        except Exception:
+            pass
+    # нет фото — кружок с первой буквой, как в Telegram
+    color = AVATAR_COLORS[m.user_id % len(AVATAR_COLORS)]
+    img = Image.new("RGB", (size, size), color)
+    letter = _display(m)[:1].upper()
+    f = font("SemiBold", AVATAR // 2 - 2)
+    if not _has_glyph(f, letter):
+        f = _fallback(f.size)
+    ImageDraw.Draw(img).text((size / 2, size / 2), letter, font=f, fill=(255, 255, 255), anchor="mm")
+    return img
+
+
+def render_top(chat_title: str, members: list[Member], avatars: dict[int, bytes | None]) -> bytes:
     rows = max(len(members), 1)
-    height = HEADER_H + COLS_H + rows * ROW_H + PAD + FOOTER_H
-    img = Image.new("RGB", (WIDTH, height), BG)
+    height = HEADER_H + COLS_H + rows * ROW_H + PAD
+    img = Image.new("RGB", (WIDTH * S, height * S), BG)
     d = ImageDraw.Draw(img)
 
-    f_title = ImageFont.truetype(str(FONT_BOLD), 38)
-    f_sub = ImageFont.truetype(str(FONT_REGULAR), 22)
-    f_col = ImageFont.truetype(str(FONT_BOLD), 18)
-    f_row = ImageFont.truetype(str(FONT_REGULAR), 26)
-    f_row_b = ImageFont.truetype(str(FONT_BOLD), 26)
-    f_place = ImageFont.truetype(str(FONT_BOLD), 22)
+    def box(x0, y0, x1, y1, r, fill):
+        d.rounded_rectangle((x0 * S, y0 * S, x1 * S, y1 * S), r * S, fill=fill)
 
-    d.text((PAD, 34), "Топ-15 по репутации", font=f_title, fill=TEXT)
-    d.text((PAD, 84), _fit(d, _clean(chat_title), f_sub, WIDTH - 2 * PAD), font=f_sub, fill=MUTED)
+    def text(x, y, t, f, fill, anchor="la"):
+        d.text((x * S, y * S), t, font=f, fill=fill, anchor=anchor)
 
-    x_place, x_name = PAD + 36, PAD + 84
-    x_rep_r, x_msg_r = WIDTH - PAD - 190, WIDTH - PAD - 20
+    text(PAD, 34, "Топ-15 по репутации", font("Bold", 36), TEXT)
+    sub = font("Medium", 20)
+    _draw_name(d, PAD * S, 92 * S, _fit(d, _clean(chat_title), sub, (WIDTH - 2 * PAD) * S), sub, MUTED)
+
+    x_place = PAD + 30
+    x_avatar = PAD + 60
+    x_name = x_avatar + AVATAR + 14
+    x_rep_r, x_msg_r = WIDTH - PAD - 170, WIDTH - PAD - 22
+
     y = HEADER_H
-    d.text((x_place, y + 12), "#", font=f_col, fill=MUTED, anchor="ma")
-    d.text((x_name, y + 12), "УЧАСТНИК", font=f_col, fill=MUTED)
-    d.text((x_rep_r, y + 12), "РЕП", font=f_col, fill=MUTED, anchor="ra")
-    d.text((x_msg_r, y + 12), "СООБЩЕНИЙ", font=f_col, fill=MUTED, anchor="ra")
+    col = font("SemiBold", 14)
+    text(x_place, y + 12, "#", col, MUTED, "ma")
+    text(x_name, y + 12, "УЧАСТНИК", col, MUTED)
+    text(x_rep_r, y + 12, "РЕПУТАЦИЯ", col, MUTED, "ra")
+    text(x_msg_r, y + 12, "СООБЩЕНИЙ", col, MUTED, "ra")
     y += COLS_H
 
     if not members:
-        d.rounded_rectangle((PAD, y, WIDTH - PAD, y + ROW_H - 6), 12, fill=CARD)
-        d.text((WIDTH // 2, y + (ROW_H - 6) // 2), "Пока никто не получил репутацию",
-               font=f_row, fill=MUTED, anchor="mm")
+        box(PAD, y, WIDTH - PAD, y + ROW_H - ROW_GAP, 14, CARD)
+        text(WIDTH / 2, y + (ROW_H - ROW_GAP) / 2, "Пока никто не получил репутацию",
+             font("Medium", 22), MUTED, "mm")
 
-    name_max_w = x_rep_r - 120 - x_name
+    mask = _circle_mask(AVATAR * S)
+    name_max_w = (x_rep_r - 130 - x_name) * S
     for i, m in enumerate(members, start=1):
-        box = (PAD, y, WIDTH - PAD, y + ROW_H - 6)
-        d.rounded_rectangle(box, 12, fill=CARD if i % 2 else CARD_ALT)
-        cy = y + (ROW_H - 6) // 2
+        box(PAD, y, WIDTH - PAD, y + ROW_H - ROW_GAP, 14, CARD if i % 2 else CARD_ALT)
+        cy = y + (ROW_H - ROW_GAP) / 2
 
         if i in MEDALS:
-            r = 18
-            cx = x_place
-            d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=MEDALS[i])
-            d.text((cx, cy), str(i), font=f_place, fill=BG, anchor="mm")
+            r = 15
+            medal = Image.new("RGB", (r * 2 * S, r * 2 * S), MEDALS[i])
+            img.paste(medal, (int((x_place - r) * S), int((cy - r) * S)), _circle_mask(r * 2 * S))
+            text(x_place, cy, str(i), font("Bold", 16), BG, "mm")
         else:
-            d.text((x_place, cy), str(i), font=f_place, fill=MUTED, anchor="mm")
+            text(x_place, cy, str(i), font("SemiBold", 18), MUTED, "mm")
 
-        name = _fit(d, _clean(m.display_name), f_row_b if i <= 3 else f_row, name_max_w)
-        d.text((x_name, cy), name, font=f_row_b if i <= 3 else f_row, fill=TEXT, anchor="lm")
-        d.text((x_rep_r, cy), str(m.rep), font=f_row_b, fill=ACCENT, anchor="rm")
-        d.text((x_msg_r, cy), str(m.messages), font=f_row, fill=MUTED, anchor="rm")
+        av = _avatar(m, avatars.get(m.user_id), AVATAR * S)
+        img.paste(av, (x_avatar * S, int((cy - AVATAR / 2) * S)), mask)
+
+        f_name = font("SemiBold" if i <= 3 else "Medium", 22)
+        _draw_name(d, x_name * S, cy * S, _fit(d, _display(m), f_name, name_max_w), f_name, TEXT)
+        text(x_rep_r, cy, str(m.rep), font("Bold", 22), ACCENT, "rm")
+        text(x_msg_r, cy, str(m.messages), font("Medium", 20), MUTED, "rm")
         y += ROW_H
 
     buf = io.BytesIO()
