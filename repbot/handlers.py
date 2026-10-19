@@ -141,7 +141,8 @@ async def cmd_start(message: Message, bot: Bot, config: Config) -> None:
 @router.message(Command("help", "start"))
 async def cmd_help(message: Message, config: Config) -> None:
     text = HELP_TEXT.format(limit=config.daily_rep_limit)
-    if message.from_user and message.from_user.id in config.admin_ids:
+    # админские команды показываем только самому админу в личке, не в группах
+    if message.chat.type == "private" and message.from_user and message.from_user.id in config.admin_ids:
         text += ADMIN_HELP_TEXT
     await message.reply(text)
 
