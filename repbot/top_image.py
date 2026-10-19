@@ -28,7 +28,8 @@ CARD_ALT = (34, 38, 50)
 TEXT = (240, 242, 247)
 MUTED = (134, 141, 158)
 ACCENT = (110, 168, 255)
-STAR_ALPHA = 55  # прозрачность звёзд на фоне (0 — не видно, 255 — сплошные)
+STAR_ALPHA = 38  # прозрачность звёзд на фоне (0 — не видно, 255 — сплошные)
+CARD_ALPHA = 215  # плашки строк чуть просвечивают, чтобы звёзды были видны позади
 MEDALS = {1: (255, 196, 61), 2: (200, 208, 220), 3: (222, 145, 86)}
 # цвета «пустых» аватарок как в Telegram
 AVATAR_COLORS = [
@@ -171,12 +172,15 @@ def render_top(chat_title: str, members: list[Member], avatars: dict[int, bytes 
     def box(x0, y0, x1, y1, r, fill):
         d.rounded_rectangle((x0 * S, y0 * S, x1 * S, y1 * S), r * S, fill=fill)
 
-    # сначала плашки строк, потом поверх них звёзды, а уже потом текст и аватарки
+    # звёзды — на самом заднем плане, поверх них полупрозрачные плашки строк, затем всё остальное
+    img = _draw_stars(img)
+    cards = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(cards)
     y0 = HEADER_H + COLS_H
     for i in range(1, rows + 1):
         y = y0 + (i - 1) * ROW_H
-        box(PAD, y, WIDTH - PAD, y + ROW_H - ROW_GAP, 14, CARD if i % 2 else CARD_ALT)
-    img = _draw_stars(img)
+        box(PAD, y, WIDTH - PAD, y + ROW_H - ROW_GAP, 14, (*(CARD if i % 2 else CARD_ALT), CARD_ALPHA))
+    img = Image.alpha_composite(img.convert("RGBA"), cards).convert("RGB")
     d = ImageDraw.Draw(img)
 
     def text(x, y, t, f, fill, anchor="la"):
