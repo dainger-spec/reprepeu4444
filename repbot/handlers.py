@@ -32,10 +32,8 @@ group_only = F.chat.type.in_({"group", "supergroup"})
 # +rep от одного человека не должны обрабатываться параллельно, иначе можно обойти лимит
 rep_lock = asyncio.Lock()
 
-HELP_TEXT = (
-    "<b>РЕП — бот репутации</b>\n\n"
-    "Добавьте меня в группу — там я веду профили и репутацию: сколько написано "
-    "сообщений, когда человек вступил и какая у него репутация.\n\n"
+# справка в группе
+GROUP_HELP_TEXT = (
     "Чтобы повысить репутацию, ответьте на сообщение участника словами "
     "<code>+rep</code> или <code>+реп</code>. Можно выдать {limit} +rep в сутки. "
     "Репутация показывается серой плашкой рядом с ником.\n\n"
@@ -46,6 +44,13 @@ HELP_TEXT = (
     "/help — справка"
 )
 
+# справка в личке с ботом: то же самое плюс пара слов о боте
+HELP_TEXT = (
+    "<b>РЕП — бот репутации</b>\n\n"
+    "Добавьте меня в группу — там я веду профили и репутацию: сколько написано "
+    "сообщений, когда человек вступил и какая у него репутация.\n\n"
+) + GROUP_HELP_TEXT
+
 ADMIN_HELP_TEXT = (
     "\n\n<b>Для администратора бота:</b>\n"
     "/chats — группы бота: разрешить или отключить (в личке)\n"
@@ -55,7 +60,7 @@ ADMIN_HELP_TEXT = (
     "/addrep N — прибавить/отнять репутацию (N может быть отрицательным)\n"
     "/check — проверить, хватает ли боту прав для плашек\n"
     "/importrep — перенести репутацию из rep_import.csv в эту группу (один раз)\n"
-    "/chatid — узнать ID чата (для ALLOWED_CHAT_ID)"
+    "/chatid — узнать ID группы"
 )
 
 
@@ -140,9 +145,12 @@ async def cmd_start(message: Message, bot: Bot, config: Config) -> None:
 
 @router.message(Command("help", "start"))
 async def cmd_help(message: Message, config: Config) -> None:
+    if message.chat.type != "private":
+        await message.reply(GROUP_HELP_TEXT.format(limit=config.daily_rep_limit))
+        return
     text = HELP_TEXT.format(limit=config.daily_rep_limit)
-    # админские команды показываем только самому админу в личке, не в группах
-    if message.chat.type == "private" and message.from_user and message.from_user.id in config.admin_ids:
+    # админские команды показываем только самому админу в личке
+    if message.from_user and message.from_user.id in config.admin_ids:
         text += ADMIN_HELP_TEXT
     await message.reply(text)
 
