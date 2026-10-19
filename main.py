@@ -1,13 +1,14 @@
 import asyncio
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError, TelegramUnauthorizedError
 from aiogram.types import BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeDefault
 
-from repbot.config import ConfigError, load_config
+from repbot.config import BASE_DIR, ConfigError, load_config
 from repbot.db import Database
 from repbot.handlers import router
 from repbot.importer import importer
@@ -92,8 +93,24 @@ async def main() -> None:
         await bot.session.close()
 
 
+def setup_logging() -> None:
+    # stdout, а не stderr: некоторые хостинги показывают только его.
+    # Плюс файл data/bot.log — на случай, если хостинг не показывает логи вовсе.
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    try:
+        log_dir = BASE_DIR / "data"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(log_dir / "bot.log", maxBytes=1_000_000, backupCount=1, encoding="utf-8"))
+    except OSError:
+        pass
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=handlers
+    )
+
+
 def run() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    setup_logging()
+    log.info("Запуск: Python %s", sys.version.split()[0])
     try:
         asyncio.run(main())
     except ConfigError as e:
@@ -107,6 +124,9 @@ def run() -> None:
         sys.exit(1)
     except KeyboardInterrupt:
         pass
+    except Exception:
+        log.exception("Бот остановился из-за ошибки")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
